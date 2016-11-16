@@ -1,0 +1,262 @@
+{
+    "$schema": "http://schema.management.azure.com/schemas/2014-04-01-preview/deploymentTemplate.json#",
+    "contentVersion": "1.0.0.0",
+    "parameters": {
+        "storageAccountType": {
+            "type": "string",
+            "defaultValue": "Standard_GRS",
+            "allowedValues": [
+                "Standard_LRS",
+                "Standard_ZRS",
+                "Standard_GRS",
+                "Standard_RAGRS",
+                "Premium_LRS"
+            ]
+        },
+        "eventHubName": {
+            "type": "string",
+            "metadata": {
+                "description": "Name of the Event Hub"
+            }
+        }
+    },
+    "variables": {
+        "location": "[resourceGroup().location]",
+        "stgApiVersion": "2015-06-15",
+        "ehApiVersion": "2015-08-01",
+        "asaApiVersion": "2015-09-01",
+        "uniqueIdentifier": "[uniqueString(resourceGroup().id)]",
+        "storageAccountName": "[concat(resourceGroup().name, variables('uniqueIdentifier'))]",
+        "namespaceName": "[concat(resourceGroup().name, variables('uniqueIdentifier'), '-ns')]",
+        "defaultSASKeyName": "RootManageSharedAccessKey",
+        "authRuleResourceId": "[resourceId('Microsoft.EventHub/namespaces/authorizationRules', variables('namespaceName'), variables('defaultSASKeyName'))]",
+        "asaCCUJobName": "ccu",
+        "asaCCUJobQuery": "WITH ActiveSessions AS\r\n(\r\n\tSELECT\r\n\t\tGameId, PlayerId, Country, City, System.timestamp as WindowEnd, Count(*) as NumberOfStarts\r\n\tFROM\r\n\t\tInput timestamp by time\r\n\tGROUP BY\r\n\t\tHoppingWindow(second, 300, 10), GameId, PlayerId, Country, City\r\n\tHAVING\r\n\t\tMIN(GameActivity) = 1\r\n),\r\nCCU AS\r\n(\r\n\tSELECT\r\n\t\tGameId, System.timestamp as timewindow, Country, City, COUNT(PlayerId) as NumActiveSessions\r\n\tFROM\r\n\t\tActiveSessions\r\n\tGROUP BY\r\n\t\tGameId, Country, City, SlidingWindow(second, 1)\r\n)\r\nSELECT * INTO outBlobCCUs FROM CCU\r\nSELECT * INTO outPBI FROM CCU",
+        "asaCCUConsumerGroupName": "asaCCU",
+        "asaCCUContainerName": "ccus",
+        "asaDurationsJobName": "sessionDurations",
+        "asaDurationsJobQuery": "WITH Durations AS\r\n(\r\n\tSELECT\r\n\t\tPlayerId, GameId, time as EndTime, Latitude, Longitude, City, Country, DATEDIFF(second, LAST(time) OVER (\r\n\t\t\tPARTITION BY PlayerId, GameId\r\n\t\t\tLIMIT DURATION(second, 300)\r\n\t\t\tWHEN GameActivity = '1'\r\n\t\t), time) as Duration\r\n\tFROM\r\n\t\tInput TIMESTAMP BY time\r\n\tWHERE\r\n\t\tGameActivity = '0'\r\n)\r\nSELECT PlayerId as Player, GameId as Game, EndTime, Latitude, Longitude, City, Country, Duration INTO outBlob FROM Durations\r\nSELECT PlayerId as Player, GameId as Game, EndTime, Latitude, Longitude, City, Country, Duration INTO outPBI FROM Durations",
+        "asaDurationsConsumerGroupName": "asaDurations",
+        "asaDurationsContainerName": "durations",
+        "asaRawConsumerGroupName": "asaRaw",
+        "asaRawDataContainerName": "rawdata",
+        "asaRawJobName": "rawdata",
+        "asaRawJobQuery": "Select\r\n\tCount(*) as numUsers,\r\n\tSystem.timestamp as time\r\nInto BlobSink\r\nFrom\r\n\tInput timestamp by ClientUtc\r\nWhere\r\n\tEvent = 'heartbeat'\r\n\tor Event = 'session-start'\r\nGroup By\r\n\ttumblingwindow(second, 1), time"
+    },
+    "resources": [
+        {
+            "apiVersion": "[variables('stgApiVersion')]",
+            "type": "Microsoft.Storage/storageAccounts",
+            "name": "[variables('storageAccountName')]",
+            "location": "[resourceGroup().location]",
+            "properties": {
+                "accountType": "[parameters('storageAccountType')]"
+            }
+        },
+        {
+            "apiVersion": "[variables('ehApiVersion')]",
+            "name": "[variables('namespaceName')]",
+            "type": "Microsoft.EventHub/Namespaces",
+            "location": "[variables('location')]",
+            "sku": {
+                "name": "Standard",
+                "tier": "Standard"
+            },
+            "resources": [
+                {
+                    "apiVersion": "[variables('ehApiVersion')]",
+                    "name": "[parameters('eventHubName')]",
+                    "type": "EventHubs",
+                    "dependsOn": [
+                        "[concat('Microsoft.EventHub/namespaces/', variables('namespaceName'))]"
+                    ],
+                    "properties": {
+                        "path": "[parameters('eventHubName')]"
+                    },
+                    "resources": [
+                        {
+                            "apiVersion": "[variables('ehApiVersion')]",
+                            "name": "[variables('asaCCUConsumerGroupName')]",
+                            "type": "ConsumerGroups",
+                            "dependsOn": [
+                                "[parameters('eventHubName')]"
+                            ],
+                            "properties": {}
+                        },
+                        {
+                            "apiVersion": "[variables('ehApiVersion')]",
+                            "name": "[variables('asaRawConsumerGroupName')]",
+                            "type": "ConsumerGroups",
+                            "dependsOn": [
+                                "[parameters('eventHubName')]"
+                            ]
+                        },
+                        {
+                            "apiVersion": "[variables('ehApiVersion')]",
+                            "name": "[variables('asaDurationsConsumerGroupName')]",
+                            "type": "ConsumerGroups",
+                            "dependsOn": [
+                                "[parameters('eventHubName')]"
+                            ]
+                        }
+                    ]
+                }
+            ]
+        },
+        {
+            "apiVersion": "[variables('asaApiVersion')]",
+            "comments": "Azure stream analytics job for calculating the number of concurrent users",
+            "type": "Microsoft.StreamAnalytics/StreamingJobs",
+            "name": "[variables('asaCCUJobName')]",
+            "location": "[resourceGroup().location]",
+            "properties": {
+                "sku": {
+                    "name": "Standard"
+                },
+                "outputStartMode": "LastOutputEventTime",
+                "inputs": [
+                    {
+                        "name": "Input",
+                        "properties": {
+                            "type": "stream",
+                            "serialization": {
+                                "type": "JSON",
+                                "properties": {
+                                    "encoding": "UTF8"
+                                }
+                            },
+                            "datasource": {
+                                "type": "Microsoft.ServiceBus/EventHub",
+                                "properties": {
+                                    "eventHubName": "[parameters('eventHubName')]",
+                                    "serviceBusNamespace": "[variables('namespaceName')]",
+                                    "sharedAccessPolicyName": "[variables('defaultSASKeyName')]",
+                                    "sharedAccessPolicyKey": "[listkeys(variables('authRuleResourceId'), variables('ehApiVersion')).primaryKey]",
+                                    "consumerGroupName": "[variables('asaCCUConsumerGroupName')]"
+                                }
+                            }
+                        }
+                    }
+                ],
+                "transformation": {
+                    "name": "[variables('asaCCUJobName')]",
+                    "properties": {
+                        "streamingUnits": 1,
+                        "query": "[variables('asaCCUJobQuery')]"
+                    }
+                },
+                "outputs": [
+                    {
+                        "name": "outBlobCCUs",
+                        "properties": {
+                            "serialization": {
+                                "type": "CSV",
+                                "properties": {
+                                    "fieldDelimiter": ",",
+                                    "encoding": "UTF8"
+                                }
+                            },
+                            "datasource": {
+                                "type": "Microsoft.Storage/Blob",
+                                "properties": {
+                                    "storageAccounts": [
+                                        {
+                                            "accountName": "[variables('storageAccountName')]",
+                                            "accountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), '2015-06-15').key1]"
+                                        }
+                                    ],
+                                    "container": "[variables('asaCCUContainerName')]",
+                                    "pathPattern": "sessions",
+                                    "dateFormat": "yyyy/MM/dd",
+                                    "timeFormat": "HH"
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.EventHub/namespaces', variables('namespaceName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+            ]
+        },
+        {
+            "apiVersion": "[variables('asaApiVersion')]",
+            "comments": "Azure stream analytics job for calculating the session durations",
+            "type": "Microsoft.StreamAnalytics/StreamingJobs",
+            "name": "[variables('asaDurationsJobName')]",
+            "location": "[resourceGroup().location]",
+            "properties": {
+                "sku": {
+                    "name": "Standard"
+                },
+                "outputStartMode": "LastOutputEventTime",
+                "inputs": [
+                    {
+                        "name": "Input",
+                        "properties": {
+                            "type": "stream",
+                            "serialization": {
+                                "type": "JSON",
+                                "properties": {
+                                    "encoding": "UTF8"
+                                }
+                            },
+                            "datasource": {
+                                "type": "Microsoft.ServiceBus/EventHub",
+                                "properties": {
+                                    "eventHubName": "[parameters('eventHubName')]",
+                                    "serviceBusNamespace": "[variables('namespaceName')]",
+                                    "sharedAccessPolicyName": "[variables('defaultSASKeyName')]",
+                                    "sharedAccessPolicyKey": "[listkeys(variables('authRuleResourceId'), variables('ehApiVersion')).primaryKey]",
+                                    "consumerGroupName": "[variables('asaDurationsConsumerGroupName')]"
+                                }
+                            }
+                        }
+                    }
+                ],
+                "transformation": {
+                    "name": "[variables('asaDurationsJobName')]",
+                    "properties": {
+                        "streamingUnits": 1,
+                        "query": "[variables('asaDurationsJobQuery')]"
+                    }
+                },
+                "outputs": [
+                    {
+                        "name": "outBlob",
+                        "properties": {
+                            "serialization": {
+                                "type": "CSV",
+                                "properties": {
+                                    "fieldDelimiter": ",",
+                                    "encoding": "UTF8"
+                                }
+                            },
+                            "datasource": {
+                                "type": "Microsoft.Storage/Blob",
+                                "properties": {
+                                    "storageAccounts": [
+                                        {
+                                            "accountName": "[variables('storageAccountName')]",
+                                            "accountKey": "[listKeys(resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName')), '2015-06-15').key1]"
+                                        }
+                                    ],
+                                    "container": "[variables('asaDurationsContainerName')]",
+                                    "pathPattern": "durations",
+                                    "dateFormat": "yyyy/MM/dd",
+                                    "timeFormat": "HH"
+                                }
+                            }
+                        }
+                    }
+                ]
+            },
+            "dependsOn": [
+                "[resourceId('Microsoft.EventHub/namespaces', variables('namespaceName'))]",
+                "[resourceId('Microsoft.Storage/storageAccounts', variables('storageAccountName'))]"
+            ]
+        }
+    ],
+    "outputs": {}
+}
