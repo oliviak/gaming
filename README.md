@@ -42,3 +42,5 @@ Some sample queries:
       * players that played Game in Munich by duration as a stack bar
       Pin one of these visuals to the dashboard as well.
       ![](PBI/qa.jpg)
+
+<a href="https://portal.azure.com/#create/Microsoft.Template/uri/https%3A%2F%2Fraw.githubusercontent.com%2Foliviak%2Fgaming%2Fmaster%2Farmdeploy.json" target="_blank">    <img src="http://azuredeploy.net/deploybutton.png"/></a>
